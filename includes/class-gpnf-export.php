@@ -1,0 +1,369 @@
+<?php
+
+/**
+ * Class GPNF_Export
+ *
+ * Primary purpose: Handle exporting child entries alongside their corresponding parent entry.
+ * Secondary purpose: Handle remapping child forms on Nested Form fields when exporting/importing a parent form.
+ */
+class GPNF_Export {
+
+	private static $instance = null;
+
+	public static function get_instance() {
+		if ( null == self::$instance ) {
+			self::$instance = new self;
+		}
+
+		return self::$instance;
+	}
+
+	private function __construct() {
+
+		if ( version_compare( GFForms::$version, '2.4.11.5', '>=' ) ) {
+			add_filter( 'gform_export_fields', array( $this, 'set_export_fields' ) );
+			add_filter( 'gform_export_line', array( $this, 'append_child_entry_rows' ), 10, 6 );
+		}
+
+		add_filter( 'gform_export_form', array( $this, 'export_child_form_title' ) );
+		add_action( 'gform_forms_post_import', array( $this, 'set_imported_child_form_id' ) );
+
+	}
+
+	public function set_export_fields( $form ) {
+
+		if ( $this->are_export_fields_disabled() ) {
+			return $form;
+		}
+
+		for ( $i = count( $form['fields'] ) - 1; $i >= 0; $i-- ) {
+
+			/* @var GF_Field $field */
+			$field = $form['fields'][ $i ];
+			if ( ! is_a( $field, 'GF_Field' ) || $field->type !== 'form' ) {
+				continue;
+			}
+
+			$headers = array();
+
+			/* @var GF_Field $child_field */
+			foreach ( $this->get_child_fields( $field ) as $child_field ) {
+
+				if ( $child_field->displayOnly ) {
+					continue;
+				}
+
+				$field->set_context_property( 'use_admin_label', true );
+				$child_field->set_context_property( 'use_admin_label', true );
+
+				$header = sprintf( '%s / %s', $field->get_field_label( false, null ), $child_field->get_field_label( false, null ) );
+				/**
+				 * Modify the header label for the current child field.
+				 *
+				 * @since 1.0
+				 *
+				 * @param string    $header      The default header label.
+				 * @param array     $form        The current form object.
+				 * @param \GF_Field $field       The current Nested Form field.
+				 * @param \GF_Field $child_field The current child field.
+				 * @param array     $input       The current input object, if exporting a specific input.
+				 */
+				$header = gf_apply_filters( array( 'gpnf_export_child_field_header', $form['id'], $field->id ), $header, $form, $field, $child_field, null );
+				$header = array(
+					'id'    => sprintf( '%d.%d', $field->id, $child_field->id ),
+					'label' => $header,
+				);
+
+				$headers[] = $header;
+
+				add_filter( "gform_entries_field_header_pre_export_{$form['id']}_{$header['id']}", array( $this, 'set_export_header_label' ), 10, 3 );
+				if ( $child_field->get_entry_inputs() ) {
+
+					$field_label = $header['label'];
+
+					/**
+					 * Exclude the addition of form fields hidden inputs to the parent form export setings.
+					 *
+					 * @since 1.1.68
+					 *
+					 * @param bool  $exclude_hidden_fields Indicate whether or not child fields hidden inputs should be available for export. Defaults to `false`.
+					 * @param array $form                  The current form object.
+					 */
+					$exclude_hidden_fields_inputs = gf_apply_filters( array( 'gpnf_export_exclude_hidden_field_inputs', $form['id'], $field->id ), false, $form );
+
+					foreach ( $child_field->get_entry_inputs() as $input ) {
+						if ( $exclude_hidden_fields_inputs && rgar( $input, 'isHidden' ) ) {
+							continue;
+						}
+
+						$header = sprintf( '%s (%s)', $field_label, $input['label'] );
+						$header = gf_apply_filters( array( 'gpnf_export_child_field_header', $form['id'], $field->id, $input['id'] ), $header, $form, $field, $child_field, $input );
+						$header = array(
+							'id'    => sprintf( '%d.%s', $field->id, $input['id'] ),
+							'label' => $header,
+						);
+
+						$headers[] = $header;
+
+						add_filter( "gform_entries_field_header_pre_export_{$form['id']}_{$header['id']}", array( $this, 'set_export_header_label' ), 10, 3 );
+
+					}
+				}
+			}
+
+			array_splice( $form['fields'], $i + 1, 0, $headers );
+
+		}
+
+		return $form;
+	}
+
+	public function set_export_header_label( $label, $form, $field ) {
+
+		$id_bits  = explode( '_', current_filter() );
+		$field_id = array_pop( $id_bits );
+
+		foreach ( $form['fields'] as $field ) {
+			if ( $field->id === $field_id ) {
+				$field->set_context_property( 'use_admin_label', true );
+				return $field->get_field_label( false, null );
+			}
+		}
+
+		return $label;
+	}
+
+	public function append_child_entry_rows( $line, $form, $columns, $field_rows, $entry, $separator ) {
+
+		$parent_entry       = new GPNF_Entry( $entry );
+		$nested_form_fields = GFCommon::get_fields_by_type( $form, array( 'form' ) );
+		$lines              = array();
+
+		/**
+		 * Enable the output of parent entry data on child entry rows.
+		 *
+		 * @since x.x.x
+		 *
+		 * @param bool  $export_parent Should parent entry data be exported on child entry rows?
+		 * @param array $form          The parent form.
+		 * @param array $entry         The parent entry.
+		 */
+		$export_parent = gf_apply_filters( array( 'gpnf_export_parent_entry_data_on_child_entry_rows', $form['id'] ), false, $form, $entry );
+
+		foreach ( $nested_form_fields as $nested_form_field ) {
+			foreach ( $parent_entry->get_child_entries( $nested_form_field->id ) as $child_entry ) {
+
+				$_line           = array();
+				$has_child_field = false;
+
+				foreach ( $columns as $column ) {
+					if ( intval( $column ) == $nested_form_field->id && $column != $nested_form_field->id ) {
+						$has_child_field = true;
+						$id_bits         = explode( '.', $column );
+						// Check for input-specific fields.
+						$child_form_field_id = count( $id_bits ) === 3 ? join( '.', array_slice( $id_bits, -2, 2 ) ) : array_pop( $id_bits );
+						$value               = self::get_nested_field_value( $nested_form_field->gpnfForm, $child_entry, $child_form_field_id );
+						$_line[]             = self::escape_value( $value );
+					} elseif ( ! is_numeric( $column ) ) {
+						$field = GFAPI::get_field( $form, $column );
+						$value = self::escape_value( $field->get_value_export( $child_entry, $column, false, true ) );
+						// Format the Created Date and Payment Date for Nested Entries as Gravity Forms does for the Parent Entry.
+						// Same logic as Gravity Forms export.php
+						if ( $column === 'date_created' || $column === 'payment_date' ) {
+							$value           = $entry[ $column ];
+							$lead_gmt_time   = mysql2date( 'G', $value );
+							$lead_local_time = GFCommon::get_local_timestamp( $lead_gmt_time );
+							$value           = date_i18n( 'Y-m-d H:i:s', $lead_local_time, true );
+						}
+
+						$_line[] = $value;
+					} else {
+						if ( $export_parent ) {
+							$field = GFAPI::get_field( $form, $column );
+							$value = $field->get_value_export( $entry, $column, false, true );
+
+							/*
+							 * If the field is a List field and has multiple columns, we will need to take the multi-
+							 * dimensional array into account and push each row into the $_line array which will then
+							 * get imploded using a pipe separator.
+							 */
+							if ( $field->get_input_type() === 'list' && is_array( $value ) && is_array( rgar( $value, 0 ) ) ) {
+								foreach ( $value as $row ) {
+									$_line[] = self::escape_value( $row );
+								}
+							} else {
+								$_line[] = self::escape_value( $value );
+							}
+						} else {
+							$counter = rgar( $field_rows, $column, 1 );
+							while ( $counter > 0 ) {
+								$_line[] = '""';
+								$counter--;
+							}
+						}
+					}
+				}
+
+				if ( $has_child_field ) {
+					$lines[] = implode( $separator, $_line );
+				}
+			}
+		}
+
+		if ( empty( $lines ) ) {
+			return $line;
+		}
+
+		/**
+		 * Disable the output of parent entry rows so that only child entry rows are exported.
+		 *
+		 * @since x.x.x
+		 *
+		 * @param bool  $export_parent Should parent entry rows be exported?
+		 * @param array $form          The parent form.
+		 * @param array $entry         The parent entry.
+		 */
+		if ( gf_apply_filters( array( 'gpnf_export_parent_entry_row', $form['id'] ), true, $form, $entry ) ) {
+			array_unshift( $lines, $line );
+		}
+
+		return implode( "\n", $lines );
+	}
+
+	public function are_export_fields_disabled() {
+		/**
+		 * Disable the addition of child form fields to the parent form export settings.
+		 *
+		 * @since 1.0-beta-8
+		 *
+		 * @param bool $disable_export_fields Indicate whether child fields of a Nested Form field should be available to export when exporting parent form entries. Defaults to `false`.
+		 */
+		return apply_filters( 'gpnf_disable_export_fields', false );
+	}
+
+	public function get_nested_field_value( $nested_form_id, $nested_form_entry, $nested_field_id ) {
+		if ( is_numeric( $nested_field_id ) ) {
+			$field      = GFFormsModel::get_field( $nested_form_id, $nested_field_id );
+			$input_type = $field->get_input_type();
+
+			if ( $input_type === 'list' ) {
+
+				$value = $field->get_value_export( $nested_form_entry, $nested_field_id, false, true );
+				if ( ! $value ) {
+					return $value;
+				}
+
+				// Handle multi-column List fields.
+				array_walk( $value, function( &$_value ) {
+					if ( is_array( $_value ) ) {
+						$_value = implode( ',', $_value );
+					}
+				} );
+
+				return implode( '|', $value );
+			} elseif ( $input_type === 'chainedselect' ) {
+				// ChainedSelects has multiple inputs, combine them as we do with lists
+				$values = array();
+				foreach ( $field->inputs as $input ) {
+					$values[] = $field->get_value_export( $nested_form_entry, $input['id'], false, true );
+				}
+
+				$nested_field = GFFormsModel::get_field( $nested_form_id, $nested_field_id );
+				$parts        = explode( '.', $nested_field_id );
+
+				// Handle getting value for a specific input from a ChainedSelect field
+				if ( rgar( $parts, 1 ) && $nested_field->get_input_type() === 'chainedselect' ) {
+					$nested_field_sub_id = $parts[1] - 1;
+					return rgar( $values, $nested_field_sub_id );
+				}
+
+				// Handle getting value for all inputs of the ChainedSelect field
+				return implode( '|', $values );
+			}
+		}
+
+		$field_value = gp_nested_forms()->get_field_value( GFAPI::get_form( $nested_form_id ), $nested_form_entry, $nested_field_id );
+
+		return apply_filters( 'gform_export_field_value', $field_value, $nested_form_id, $nested_field_id, $nested_form_entry );
+	}
+
+	public function escape_value( $value ) {
+
+		$value = str_replace( '"', '""', $value );
+
+		if ( is_string( $value ) && strpos( $value, '=' ) === 0 ) {
+			// Prevent Excel formulas
+			$value = "'" . $value;
+		} elseif ( is_array( $value ) ) {
+			// Convert array to a pipe-separated string
+			$value = implode( '|', $value );
+		}
+
+		return '"' . $value . '"';
+
+	}
+
+	public function get_child_fields( $field ) {
+		$child_form = GFAPI::get_form( $field->gpnfForm );
+		return $child_form['fields'];
+	}
+
+	public function export_child_form_title( $form ) {
+
+		foreach ( $form['fields'] as &$field ) {
+			if ( $field->type == 'form' ) {
+				$child_form           = GFAPI::get_form( $field->gpnfForm );
+				$field->gpnfFormTitle = $child_form['title'];
+			}
+		}
+
+		return $form;
+	}
+
+	public function set_imported_child_form_id( $forms ) {
+
+		$update_forms = array();
+
+		foreach ( $forms as $form ) {
+			foreach ( $form['fields'] as &$field ) {
+				if ( $field->type == 'form' && $field->gpnfFormTitle ) {
+					$child_form_id = $this->get_imported_form_child_id( $forms, $field->gpnfFormTitle );
+					if ( ! $child_form_id ) {
+						$all_forms = GFCache::get( 'gpnf_all_forms' );
+						if ( empty( $all_forms ) ) {
+							$all_forms = GFFormsModel::get_forms();
+						}
+						$child_form_id = $this->get_imported_form_child_id( $all_forms, $field->gpnfFormTitle );
+						GFCache::set( 'gpnf_all_forms', $all_forms );
+					}
+					$field->gpnfForm             = $child_form_id;
+					$update_forms[ $form['id'] ] = $form;
+				}
+			}
+		}
+
+		GFAPI::update_forms( $update_forms );
+
+	}
+
+	public function get_imported_form_child_id( $forms, $child_form_title ) {
+
+		$form_titles = wp_list_pluck( $forms, 'title' );
+
+		$child_form_title = preg_quote( $child_form_title, '/' );
+		$pattern          = sprintf( '/%s(\([0-9]+\))?/i', $child_form_title );
+		$matches          = preg_grep( $pattern, $form_titles );
+		if ( ! empty( $matches ) ) {
+			$match = array_keys( $matches );
+			$index = array_shift( $match );
+			return is_array( $forms[ $index ] ) ? $forms[ $index ]['id'] : $forms[ $index ]->id;
+		}
+
+		return false;
+	}
+
+}
+
+function gpnf_export() {
+	return GPNF_Export::get_instance();
+}
